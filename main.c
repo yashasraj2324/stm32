@@ -28,23 +28,52 @@ UART_HandleTypeDef huart2;
  * ============================================================ */
 
 #define UART_RX_BUFFER_SIZE       64U
+#define UART_TX_QUEUE_DEPTH       8U
+#define UART_TX_MESSAGE_SIZE      96U
 
 uint8_t uart_rx_byte;
 char uart_rx_buffer[UART_RX_BUFFER_SIZE];
+char uart_command_buffer[UART_RX_BUFFER_SIZE];
 volatile uint8_t uart_rx_index = 0;
+volatile uint8_t uart_rx_discard = 0;
+volatile uint8_t uart_command_ready = 0;
+
+typedef struct
+{
+    uint8_t data[UART_TX_MESSAGE_SIZE];
+    uint16_t length;
+} UART_TxMessage;
+
+static UART_TxMessage uart_tx_queue[UART_TX_QUEUE_DEPTH];
+static volatile uint8_t uart_tx_head = 0;
+static volatile uint8_t uart_tx_tail = 0;
+static volatile uint8_t uart_tx_busy = 0;
 
 /* ============================================================
  * Motor configuration
  * ============================================================ */
 
-#define PWM_PERIOD                999U
+#define PWM_PERIOD                4199U
 #define MAX_WHEEL_SPEED_MPS       1.0f
 #define MOTOR_COMMAND_TIMEOUT_MS  500U
+#define MOTOR_RAMP_STEP_MPS       0.05f
+#define MOTOR_UPDATE_PERIOD_MS    10U
+#define MOTOR_DIRECTION_DEADTIME_US 50U
+#define MOTOR_REVERSAL_HOLD_MS    150U
 
 volatile float target_left_velocity = 0.0f;
 volatile float target_right_velocity = 0.0f;
+static float applied_left_velocity = 0.0f;
+static float applied_right_velocity = 0.0f;
+static int8_t left_motor_direction = 0;
+static int8_t right_motor_direction = 0;
+static uint32_t left_reversal_hold_until = 0U;
+static uint32_t right_reversal_hold_until = 0U;
+static uint8_t left_reversal_pending = 0U;
+static uint8_t right_reversal_pending = 0U;
 
 volatile uint32_t last_command_tick = 0;
+static uint32_t last_motor_update_tick = 0;
 
 /* ============================================================
  * Ultrasonic configuration
@@ -89,6 +118,7 @@ static void MX_TIM14_Init(void);
 /* UART */
 
 static void UART_Send(const char *text);
+static void UART_Tx_Service(void);
 static void Process_Command(void);
 
 /* Motors */
@@ -96,12 +126,14 @@ static void Process_Command(void);
 static void Motor_Set_Left(float velocity);
 static void Motor_Set_Right(float velocity);
 static void Motor_Stop(void);
+static void Motor_Update(void);
 static uint32_t Velocity_To_PWM(float velocity);
 
 /* Ultrasonic */
 
 static void DWT_Init(void);
 static void Delay_us(uint32_t us);
+static uint32_t DWT_Cycles_Per_Us(void);
 
 static uint32_t Ultrasonic_Read(
     GPIO_TypeDef *TRIG_PORT,
@@ -109,6 +141,8 @@ static uint32_t Ultrasonic_Read(
     GPIO_TypeDef *ECHO_PORT,
     uint16_t ECHO_PIN
 );
+
+static void Motor_DeadTime(void);
 
 /* USER CODE END PFP */
 
@@ -121,19 +155,56 @@ static uint32_t Ultrasonic_Read(
 
 static void UART_Send(const char *text)
 {
-    HAL_UART_Transmit(
-        &huart2,
-        (uint8_t *)text,
-        strlen(text),
-        HAL_MAX_DELAY
-    );
+    size_t text_length = strlen(text);
+    uint8_t next_head;
+
+    if ((text_length == 0U) ||
+        (text_length >= UART_TX_MESSAGE_SIZE))
+    {
+        return;
+    }
+
+    next_head = (uint8_t)((uart_tx_head + 1U) %
+                          UART_TX_QUEUE_DEPTH);
+
+    if (next_head == uart_tx_tail)
+    {
+        return;
+    }
+
+    memcpy(uart_tx_queue[uart_tx_head].data,
+           text,
+           text_length);
+    uart_tx_queue[uart_tx_head].length = (uint16_t)text_length;
+    uart_tx_head = next_head;
+}
+
+static void UART_Tx_Service(void)
+{
+    if ((uart_tx_busy != 0U) ||
+        (uart_tx_tail == uart_tx_head))
+    {
+        return;
+    }
+
+    uart_tx_busy = 1U;
+
+    if (HAL_UART_Transmit_IT(
+            &huart2,
+            uart_tx_queue[uart_tx_tail].data,
+            uart_tx_queue[uart_tx_tail].length) != HAL_OK)
+    {
+        uart_tx_busy = 0U;
+        uart_tx_tail = (uint8_t)((uart_tx_tail + 1U) %
+                                 UART_TX_QUEUE_DEPTH);
+    }
 }
 
 /* ============================================================
  * VELOCITY → PWM
  *
  * 0.0 m/s = 0 PWM
- * 1.0 m/s = 999 PWM
+ * 1.0 m/s = 4199 PWM
  * ============================================================ */
 
 static uint32_t Velocity_To_PWM(float velocity)
@@ -182,8 +253,17 @@ static uint32_t Velocity_To_PWM(float velocity)
 static void Motor_Set_Left(float velocity)
 {
     uint32_t pwm = Velocity_To_PWM(velocity);
+    int8_t direction = (velocity > 0.0f) ? 1 : ((velocity < 0.0f) ? -1 : 0);
 
-    if (velocity > 0.0f)
+    if (direction != left_motor_direction)
+    {
+        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 0U);
+        __HAL_TIM_SET_COMPARE(&htim14, TIM_CHANNEL_1, 0U);
+        Motor_DeadTime();
+        left_motor_direction = direction;
+    }
+
+    if (direction > 0)
     {
         /* Forward */
 
@@ -199,7 +279,7 @@ static void Motor_Set_Left(float velocity)
             0
         );
     }
-    else if (velocity < 0.0f)
+    else if (direction < 0)
     {
         /* Reverse */
 
@@ -243,8 +323,17 @@ static void Motor_Set_Left(float velocity)
 static void Motor_Set_Right(float velocity)
 {
     uint32_t pwm = Velocity_To_PWM(velocity);
+    int8_t direction = (velocity > 0.0f) ? 1 : ((velocity < 0.0f) ? -1 : 0);
 
-    if (velocity > 0.0f)
+    if (direction != right_motor_direction)
+    {
+        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 0U);
+        __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, 0U);
+        Motor_DeadTime();
+        right_motor_direction = direction;
+    }
+
+    if (direction > 0)
     {
         /* Forward */
 
@@ -260,7 +349,7 @@ static void Motor_Set_Right(float velocity)
             0
         );
     }
-    else if (velocity < 0.0f)
+    else if (direction < 0)
     {
         /* Reverse */
 
@@ -302,6 +391,14 @@ static void Motor_Stop(void)
 {
     target_left_velocity = 0.0f;
     target_right_velocity = 0.0f;
+    applied_left_velocity = 0.0f;
+    applied_right_velocity = 0.0f;
+    left_motor_direction = 0;
+    right_motor_direction = 0;
+    left_reversal_hold_until = 0U;
+    right_reversal_hold_until = 0U;
+    left_reversal_pending = 0U;
+    right_reversal_pending = 0U;
 
     __HAL_TIM_SET_COMPARE(
         &htim3,
@@ -328,6 +425,137 @@ static void Motor_Stop(void)
     );
 }
 
+static float Motor_Ramp_Value(float current, float target)
+{
+    if (current < target)
+    {
+        current += MOTOR_RAMP_STEP_MPS;
+        if (current > target)
+        {
+            current = target;
+        }
+    }
+    else if (current > target)
+    {
+        current -= MOTOR_RAMP_STEP_MPS;
+        if (current < target)
+        {
+            current = target;
+        }
+    }
+
+    return current;
+}
+
+static float Motor_Update_Wheel(float current,
+                                float target,
+                                uint32_t now,
+                                uint32_t *hold_until,
+                                uint8_t *reversal_pending)
+{
+    if ((target == 0.0f) &&
+        (current == 0.0f))
+    {
+        *reversal_pending = 0U;
+        *hold_until = 0U;
+    }
+
+    if ((current != 0.0f) &&
+        (target != 0.0f) &&
+        (((current > 0.0f) && (target > 0.0f)) ||
+         ((current < 0.0f) && (target < 0.0f))))
+    {
+        *reversal_pending = 0U;
+        *hold_until = 0U;
+    }
+
+    if ((current != 0.0f) &&
+        (target != 0.0f) &&
+        (((current > 0.0f) && (target < 0.0f)) ||
+         ((current < 0.0f) && (target > 0.0f))))
+    {
+        target = 0.0f;
+        *reversal_pending = 1U;
+    }
+
+    if ((current == 0.0f) &&
+        (*reversal_pending != 0U) &&
+        (*hold_until == 0U))
+    {
+        *hold_until = now + MOTOR_REVERSAL_HOLD_MS;
+    }
+
+    if ((current == 0.0f) &&
+        (*hold_until != 0U) &&
+        ((int32_t)(now - *hold_until) < 0))
+    {
+        return 0.0f;
+    }
+
+    if ((current == 0.0f) &&
+        (*hold_until != 0U) &&
+        ((int32_t)(now - *hold_until) >= 0))
+    {
+        *hold_until = 0U;
+        *reversal_pending = 0U;
+    }
+
+    return Motor_Ramp_Value(current, target);
+}
+
+static void Motor_Update(void)
+{
+    uint32_t now = HAL_GetTick();
+
+    if ((uint32_t)(now - last_motor_update_tick) <
+        MOTOR_UPDATE_PERIOD_MS)
+    {
+        return;
+    }
+
+    last_motor_update_tick = now;
+    applied_left_velocity =
+        Motor_Update_Wheel(applied_left_velocity,
+                           target_left_velocity,
+                           now,
+                           &left_reversal_hold_until,
+                           &left_reversal_pending);
+    applied_right_velocity =
+        Motor_Update_Wheel(applied_right_velocity,
+                           target_right_velocity,
+                           now,
+                           &right_reversal_hold_until,
+                           &right_reversal_pending);
+
+    Motor_Set_Left(applied_left_velocity);
+    Motor_Set_Right(applied_right_velocity);
+}
+
+static void Motor_DeadTime(void)
+{
+    Delay_us(MOTOR_DIRECTION_DEADTIME_US);
+}
+
+/*
+ * Fault-context safe state. This intentionally uses only direct peripheral
+ * register writes and does not depend on HAL locks, SysTick, or UART.
+ */
+void Motor_SafeState_FaultContext(void)
+{
+    TIM3->CCR1 = 0U;
+    TIM3->CCR2 = 0U;
+    TIM14->CCR1 = 0U;
+    TIM2->CCR3 = 0U;
+
+    TIM3->CCER &= ~(TIM_CCER_CC1E | TIM_CCER_CC2E);
+    TIM14->CCER &= ~TIM_CCER_CC1E;
+    TIM2->CCER &= ~TIM_CCER_CC3E;
+
+    GPIOA->BSRR = (uint32_t)(GPIO_PIN_6 | GPIO_PIN_7) << 16U;
+    GPIOB->BSRR = (uint32_t)GPIO_PIN_10 << 16U;
+    GPIOC->BSRR = (uint32_t)GPIO_PIN_7 << 16U;
+}
+
 /* ============================================================
  * COMMAND PROCESSOR
  *
@@ -342,6 +570,7 @@ static void Process_Command(void)
 {
     int left_milli;
     int right_milli;
+    char extra;
 
     char response[64];
 
@@ -349,7 +578,7 @@ static void Process_Command(void)
      * PING
      * -------------------------------------------------------- */
 
-    if (strcmp(uart_rx_buffer, "PING") == 0)
+    if (strcmp(uart_command_buffer, "PING") == 0)
     {
         UART_Send("PONG\r\n");
 
@@ -360,7 +589,7 @@ static void Process_Command(void)
      * STOP
      * -------------------------------------------------------- */
 
-    if (strcmp(uart_rx_buffer, "STOP") == 0)
+    if (strcmp(uart_command_buffer, "STOP") == 0)
     {
         Motor_Stop();
 
@@ -375,13 +604,14 @@ static void Process_Command(void)
      * VEL
      * -------------------------------------------------------- */
 
-    if (strncmp(uart_rx_buffer, "VEL ", 4) == 0)
+    if (strncmp(uart_command_buffer, "VEL ", 4) == 0)
     {
         if (sscanf(
-                uart_rx_buffer + 4,
-                "%d %d",
+                uart_command_buffer + 4,
+                "%d %d %c",
                 &left_milli,
-                &right_milli
+                &right_milli,
+                &extra
             ) == 2)
         {
             /* Convert milli-m/s → m/s */
@@ -427,18 +657,6 @@ static void Process_Command(void)
                 target_right_velocity =
                     -MAX_WHEEL_SPEED_MPS;
             }
-
-            /* ------------------------------------------------
-             * Apply motor commands
-             * ------------------------------------------------ */
-
-            Motor_Set_Left(
-                target_left_velocity
-            );
-
-            Motor_Set_Right(
-                target_right_velocity
-            );
 
             /* Refresh watchdog */
 
@@ -494,13 +712,18 @@ static void Delay_us(uint32_t us)
 
     start = DWT->CYCCNT;
 
-    ticks =
-        us *
-        (HAL_RCC_GetHCLKFreq() / 1000000U);
+    ticks = us * DWT_Cycles_Per_Us();
 
     while ((DWT->CYCCNT - start) < ticks)
     {
     }
+}
+
+static uint32_t DWT_Cycles_Per_Us(void)
+{
+    uint32_t hclk = HAL_RCC_GetHCLKFreq();
+
+    return (hclk >= 1000000U) ? (hclk / 1000000U) : 1U;
 }
 
 /* ============================================================
@@ -517,8 +740,8 @@ static uint32_t Ultrasonic_Read(
     GPIO_TypeDef *ECHO_PORT,
     uint16_t ECHO_PIN)
 {
-    uint32_t timeout;
     uint32_t start;
+    uint32_t timeout_ticks;
     uint32_t pulse_ticks;
     uint32_t pulse_us;
     uint32_t distance_mm;
@@ -557,7 +780,8 @@ static uint32_t Ultrasonic_Read(
      * Wait for ECHO HIGH
      * -------------------------------------------------------- */
 
-    timeout = 0;
+    timeout_ticks = ULTRASONIC_TIMEOUT_US * DWT_Cycles_Per_Us();
+    start = DWT->CYCCNT;
 
     while (
         HAL_GPIO_ReadPin(
@@ -566,11 +790,7 @@ static uint32_t Ultrasonic_Read(
         ) == GPIO_PIN_RESET
     )
     {
-        Delay_us(1);
-
-        timeout++;
-
-        if (timeout >= ULTRASONIC_TIMEOUT_US)
+        if ((uint32_t)(DWT->CYCCNT - start) >= timeout_ticks)
         {
             return 0;
         }
@@ -582,8 +802,6 @@ static uint32_t Ultrasonic_Read(
 
     start = DWT->CYCCNT;
 
-    timeout = 0;
-
     while (
         HAL_GPIO_ReadPin(
             ECHO_PORT,
@@ -591,9 +809,7 @@ static uint32_t Ultrasonic_Read(
         ) == GPIO_PIN_SET
     )
     {
-        timeout++;
-
-        if (timeout >= ULTRASONIC_TIMEOUT_US)
+        if ((uint32_t)(DWT->CYCCNT - start) >= timeout_ticks)
         {
             return 0;
         }
@@ -658,25 +874,25 @@ int main(void)
      * Start PWM
      * ======================================================== */
 
-    HAL_TIM_PWM_Start(
+    if (HAL_TIM_PWM_Start(
         &htim3,
         TIM_CHANNEL_1
-    );
+    ) != HAL_OK) Error_Handler();
 
-    HAL_TIM_PWM_Start(
+    if (HAL_TIM_PWM_Start(
         &htim3,
         TIM_CHANNEL_2
-    );
+    ) != HAL_OK) Error_Handler();
 
-    HAL_TIM_PWM_Start(
+    if (HAL_TIM_PWM_Start(
         &htim14,
         TIM_CHANNEL_1
-    );
+    ) != HAL_OK) Error_Handler();
 
-    HAL_TIM_PWM_Start(
+    if (HAL_TIM_PWM_Start(
         &htim2,
         TIM_CHANNEL_3
-    );
+    ) != HAL_OK) Error_Handler();
 
     /* Start motors stopped */
 
@@ -686,11 +902,11 @@ int main(void)
      * Start UART interrupt reception
      * ======================================================== */
 
-    HAL_UART_Receive_IT(
+    if (HAL_UART_Receive_IT(
         &huart2,
         &uart_rx_byte,
         1
-    );
+    ) != HAL_OK) Error_Handler();
 
     /* ========================================================
      * Board peripherals
@@ -715,6 +931,15 @@ int main(void)
 
     while (1)
     {
+        if (uart_command_ready != 0U)
+        {
+            Process_Command();
+            uart_command_ready = 0U;
+        }
+
+        UART_Tx_Service();
+        Motor_Update();
+
         /* ----------------------------------------------------
          * MOTOR SAFETY WATCHDOG
          * ---------------------------------------------------- */
@@ -742,7 +967,7 @@ int main(void)
             last_ultrasonic_tick =
                 HAL_GetTick();
 
-            /* LEFT */
+    /* LEFT */
 
             left_distance_mm =
                 Ultrasonic_Read(
@@ -876,7 +1101,8 @@ void SystemClock_Config(void)
  * PB10 → TIM2_CH3 → RIGHT LPWM
  *
  * IMPORTANT:
- * Period MUST be 999.
+ * Prescaler 0 and period 4199 provide a 20 kHz carrier at the
+ * configured 84 MHz timer clock.
  * ============================================================ */
 
 static void MX_TIM2_Init(void)
@@ -886,12 +1112,12 @@ static void MX_TIM2_Init(void)
 
     htim2.Instance = TIM2;
 
-    htim2.Init.Prescaler = 83;
+    htim2.Init.Prescaler = 0;
 
     htim2.Init.CounterMode =
         TIM_COUNTERMODE_UP;
 
-    htim2.Init.Period = 999;
+    htim2.Init.Period = PWM_PERIOD;
 
     htim2.Init.ClockDivision =
         TIM_CLOCKDIVISION_DIV1;
@@ -961,12 +1187,12 @@ static void MX_TIM3_Init(void)
 
     htim3.Instance = TIM3;
 
-    htim3.Init.Prescaler = 83;
+    htim3.Init.Prescaler = 0;
 
     htim3.Init.CounterMode =
         TIM_COUNTERMODE_UP;
 
-    htim3.Init.Period = 999;
+    htim3.Init.Period = PWM_PERIOD;
 
     htim3.Init.ClockDivision =
         TIM_CLOCKDIVISION_DIV1;
@@ -1049,12 +1275,12 @@ static void MX_TIM14_Init(void)
 
     htim14.Instance = TIM14;
 
-    htim14.Init.Prescaler = 83;
+    htim14.Init.Prescaler = 0;
 
     htim14.Init.CounterMode =
         TIM_COUNTERMODE_UP;
 
-    htim14.Init.Period = 999;
+    htim14.Init.Period = PWM_PERIOD;
 
     htim14.Init.ClockDivision =
         TIM_CLOCKDIVISION_DIV1;
@@ -1243,19 +1469,30 @@ void HAL_UART_RxCpltCallback(
             (uart_rx_byte == '\n')
         )
         {
-            if (uart_rx_index > 0)
+            if ((uart_rx_index > 0U) &&
+                (uart_rx_discard == 0U) &&
+                (uart_command_ready == 0U))
             {
                 uart_rx_buffer[uart_rx_index] =
                     '\0';
 
-                Process_Command();
+                memcpy(uart_command_buffer,
+                       uart_rx_buffer,
+                       uart_rx_index + 1U);
 
-                uart_rx_index = 0;
+                uart_command_ready = 1U;
+            }
+
+            if ((uart_rx_index > 0U) ||
+                (uart_rx_discard != 0U))
+            {
+                uart_rx_index = 0U;
+                uart_rx_discard = 0U;
             }
         }
         else
         {
-            if (
+            if ((uart_rx_discard == 0U) &&
                 uart_rx_index <
                 UART_RX_BUFFER_SIZE - 1U
             )
@@ -1265,15 +1502,36 @@ void HAL_UART_RxCpltCallback(
             }
             else
             {
-                uart_rx_index = 0;
+                uart_rx_discard = 1U;
             }
         }
 
-        HAL_UART_Receive_IT(
+        if (HAL_UART_Receive_IT(
             &huart2,
             &uart_rx_byte,
             1
-        );
+        ) != HAL_OK)
+        {
+            Motor_SafeState_FaultContext();
+        }
+    }
+}
+
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART2)
+    {
+        uart_tx_tail = (uint8_t)((uart_tx_tail + 1U) %
+                                 UART_TX_QUEUE_DEPTH);
+        uart_tx_busy = 0U;
+    }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART2)
+    {
+        uart_tx_busy = 0U;
     }
 }
 
@@ -1284,6 +1542,7 @@ void HAL_UART_RxCpltCallback(
 void Error_Handler(void)
 {
     __disable_irq();
+    Motor_SafeState_FaultContext();
 
     while (1)
     {
